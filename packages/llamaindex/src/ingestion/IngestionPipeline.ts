@@ -6,6 +6,7 @@ import {
   type Document,
   type Metadata,
 } from "@llamaindex/core/schema";
+import pLimit from "../readers/utils.js";
 import type { BaseDocumentStore } from "../storage/docStore/types.js";
 import type { VectorStore, VectorStoreByType } from "../vector-store/types.js";
 import { IngestionCache, getTransformationHash } from "./IngestionCache.js";
@@ -23,13 +24,19 @@ type TransformRunArgs = {
   inPlace?: boolean;
   cache?: IngestionCache;
   docStoreStrategy?: TransformComponent;
+  numWorkers?: number;
 };
 
 export async function runTransformations(
   nodesToRun: BaseNode[],
   transformations: TransformComponent[],
   transformOptions: any = {},
-  { inPlace = true, cache, docStoreStrategy }: TransformRunArgs = {},
+  {
+    inPlace = true,
+    cache,
+    docStoreStrategy,
+    numWorkers = 1,
+  }: TransformRunArgs = {},
 ): Promise<BaseNode[]> {
   let nodes = nodesToRun;
   if (!inPlace) {
@@ -38,20 +45,44 @@ export async function runTransformations(
   if (docStoreStrategy) {
     nodes = await docStoreStrategy(nodes);
   }
-  for (const transform of transformations) {
-    if (cache) {
-      const hash = getTransformationHash(nodes, transform);
-      const cachedNodes = await cache.get(hash);
-      if (cachedNodes) {
-        nodes = cachedNodes;
+
+  if (numWorkers > 1) {
+    const limit = pLimit(numWorkers);
+    const promises = transformations.map((transform) =>
+      limit(async () => {
+        if (cache) {
+          const hash = getTransformationHash(nodes, transform);
+          const cachedNodes = await cache.get(hash);
+          if (cachedNodes) {
+            return cachedNodes;
+          } else {
+            const newNodes = await transform(nodes, transformOptions);
+            await cache.put(hash, newNodes);
+            return newNodes;
+          }
+        } else {
+          return transform(nodes, transformOptions);
+        }
+      }),
+    );
+    nodes = (await Promise.all(promises)).flat();
+  } else {
+    for (const transform of transformations) {
+      if (cache) {
+        const hash = getTransformationHash(nodes, transform);
+        const cachedNodes = await cache.get(hash);
+        if (cachedNodes) {
+          nodes = cachedNodes;
+        } else {
+          nodes = await transform(nodes, transformOptions);
+          await cache.put(hash, nodes);
+        }
       } else {
         nodes = await transform(nodes, transformOptions);
-        await cache.put(hash, nodes);
       }
-    } else {
-      nodes = await transform(nodes, transformOptions);
     }
   }
+
   return nodes;
 }
 
@@ -81,7 +112,11 @@ export class IngestionPipeline {
     this._docStoreStrategy = createDocStoreStrategy(
       this.docStoreStrategy,
       this.docStore,
-      this.vectorStores ? Object.values(this.vectorStores) : undefined,
+      this.vectorStores
+        ? Object.values(this.vectorStores).filter(
+            (store): store is VectorStore => store !== undefined,
+          )
+        : undefined,
     );
     if (!this.disableCache) {
       this.cache = new IngestionCache();
